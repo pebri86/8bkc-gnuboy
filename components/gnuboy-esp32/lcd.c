@@ -1,6 +1,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "rom/ets_sys.h"
 #include "fb.h"
@@ -39,9 +40,10 @@ void videoTask(void *pvparameters) {
 
 void vid_init()
 {
+	const size_t lineSize = 160*144*2;
 	doShutdown=false;
-	frontbuff=malloc(160*144*2);
-	backbuff=malloc(160*144*2);
+	frontbuff=heap_caps_malloc(lineSize, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	backbuff=heap_caps_malloc(lineSize, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
 	fb.w = 160;
 	fb.h = 144;
 	fb.pelsize = 2;
@@ -110,8 +112,8 @@ void vid_end()
 //	printf("Pcm %d pch %d\n", patcachemiss, patcachehit);
 }
 
-uint32_t *vidGetOverlayBuf() {
-	return (uint32_t*)fb.ptr;
+uint16_t *vidGetOverlayBuf() {
+	return (uint16_t*)fb.ptr;
 }
 
 void vidRenderOverlay() {
@@ -138,7 +140,57 @@ void ev_poll()
 }
 
 
-uint16_t oledfb[80*64];
+uint16_t oledfb[KC_SCREEN_W*KC_SCREEN_H];
+
+#if 1
+//#define NEAREST_NEIGHBOR_ALG
+
+static uint16_t getPixel(const uint16_t *bufs, int x, int y, int w1, int h1, int w2, int h2, float x_ratio, float y_ratio)
+{
+    uint16_t col;
+#ifdef NEAREST_NEIGHBOR_ALG
+    /* Resize using nearest neighbor alghorithm */
+    /* Simple and fastest way but low quality   */
+    int x2 = floor(x*x_ratio);
+    int y2 = floor(y*y_ratio);
+    col = bufs[(y2*w1)+x2];
+
+    return col;
+#else
+    /* Resize using bilinear interpolation */
+    /* higher quality but lower performance, */
+    int xv, yv, red, green, blue, a, b, c, d, index;
+	float x_diff, y_diff;
+
+    xv = floor(x_ratio * x);
+    yv = floor(y_ratio * y);
+
+    x_diff = ((x_ratio * x)) - (xv);
+    y_diff = ((y_ratio * y)) - (yv);
+
+    index = yv * w1 + xv;
+
+    a = bufs[index];
+    b = bufs[index + 1];
+    c = bufs[index + w1];
+    d = bufs[index + w1 + 1];
+
+    red = (((a >> 11) & 0x1f) * (1 - x_diff) * (1 - y_diff) + ((b >> 11) & 0x1f) * (x_diff) * (1 - y_diff) +
+           ((c >> 11) & 0x1f) * (y_diff) * (1 - x_diff) + ((d >> 11) & 0x1f) * (x_diff * y_diff));
+
+    green = (((a >> 5) & 0x3f) * (1 - x_diff) * (1 - y_diff) + ((b >> 5) & 0x3f) * (x_diff) * (1 - y_diff) +
+             ((c >> 5) & 0x3f) * (y_diff) * (1 - x_diff) + ((d >> 5) & 0x3f) * (x_diff * y_diff));
+
+    blue = (((a)&0x1f) * (1 - x_diff) * (1 - y_diff) + ((b)&0x1f) * (x_diff) * (1 - y_diff) +
+            ((c)&0x1f) * (y_diff) * (1 - x_diff) + ((d)&0x1f) * (x_diff * y_diff));
+
+    col = ((int)red << 11) | ((int)green << 5) | ((int)blue);
+
+    return col;
+#endif
+}
+
+#else
 
 //Averages four pixels into one
 int getAvgPix(uint16_t* bufs, int pitch, int x, int y) {
@@ -204,9 +256,9 @@ int getAvgPixSubpixrenderingThreeLines(uint16_t* bufs, int pitch, int x, int y) 
 	return (r<<11)+(g<<5)+(b);
 }
 
+#endif
 
-
-int addOverlayPixel(uint16_t p, uint32_t ov) {
+int addOverlayPixel(uint16_t p, uint16_t ov) {
 	int or, og, ob, a;
 	int br, bg, bb;
 	int r,g,b;
@@ -214,7 +266,7 @@ int addOverlayPixel(uint16_t p, uint32_t ov) {
 	bg=((p>>5)&0x3f)<<2;
 	bb=((p>>0)&0x1f)<<3;
 
-	a=(ov>>24)&0xff;
+	a=(ov)&0xff;
 	//hack: Always show background darker
 	a=(a/2)+128;
 
@@ -234,38 +286,48 @@ void gnuboy_esp32_videohandler() {
 	int x, y;
 	uint16_t *oledfbptr;
 	uint16_t c;
-	uint32_t *ovl;
+	uint16_t *ovl;
+#if 1
+	float x_ratio = 160/(float)KC_SCREEN_W;
+    float y_ratio = 144/(float)KC_SCREEN_H;
+#else
+	int x_ratio = ((160<<16)/KC_SCREEN_W) +1;
+    int y_ratio = ((144<<16)/KC_SCREEN_H) +1;
+#endif
 	volatile uint16_t *rendering;
 	printf("Video thread running\n");
 	memset(oledfb, 0, sizeof(oledfb));
 	while(!doShutdown) {
-		int ry; //Y on screen
 		//if (toRender==NULL) 
 		xSemaphoreTake(renderSem, portMAX_DELAY);
 		rendering=toRender;
-		ovl=(uint32_t*)overlay;
+		ovl=(uint16_t*)overlay;
 		oledfbptr=oledfb;
-		ry=0;
-		for (y=0; y<64; y++) {
+#if 1
+		for (y=0; y<KC_SCREEN_H; y++) {
+			for (x=0; x<KC_SCREEN_W; x++) {
+				c=getPixel((uint16_t*)rendering, x, y, 160, 144, KC_SCREEN_W, KC_SCREEN_H, x_ratio, y_ratio);
+				if (ovl) c=addOverlayPixel(c, *ovl++);
+				*oledfbptr++=((c>>8) | (c<<8));
+			}
+		}
+#else
+		for (y=0; y<KC_SCREEN_H; y++) {
 			int doThreeLines=((y%4)==0);
-			for (x=0; x<80; x++) {
+			for (x=0; x<KC_SCREEN_W; x++) {
+				int x2 = ((x*x_ratio)>>16);
+    			int y2 = ((y*y_ratio)>>16);
 				if (!doThreeLines) {
-					c=getAvgPixSubpixrendering((uint16_t*)rendering, 160*2, (x*2), ry);
+					c=getAvgPixSubpixrendering((uint16_t*)rendering, 160*2, x2, y2);
 				} else {
-					c=getAvgPixSubpixrenderingThreeLines((uint16_t*)rendering, 160*2, (x*2), ry);
+					c=getAvgPixSubpixrenderingThreeLines((uint16_t*)rendering, 160*2, x2, y2);
 				}
 				if (ovl) c=addOverlayPixel(c, *ovl++);
 				*oledfbptr++=(c>>8)+((c&0xff)<<8);
 			}
-			ry+=2;
-			if (doThreeLines) ry++;
 		}
+#endif
 		kchal_send_fb(oledfb);
 	}
 	vTaskDelete(NULL);
 }
-
-
-
-
-
